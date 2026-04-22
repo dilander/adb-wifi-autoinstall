@@ -109,3 +109,6 @@ powershell -ExecutionPolicy Bypass -File "adb-wifi-autoinstall.ps1" -Port 5555 -
 
 必要なら、この README に英訳版や、Windows 以外（macOS / Linux）での運用メモ、CI 自動ビルドや GitHub Actions による APK 配布フローの例などを追加します。要望があれば追記します。
 
+
+
+<!-- Fix #1 -->
