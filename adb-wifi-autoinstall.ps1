@@ -1,17 +1,21 @@
-#requires -version 5.1
+﻿#requires -version 5.1
 <#
 adb-wifi-autoinstall.ps1
 
 機能:
-- ADB Wi-Fi 接続監視(切断時に自動復旧)
+- ADB Wi-Fi 接続監視(切断時に自動復旧) ※複数端末対応
   - USBが刺さっていれば adb tcpip 5555 を叩いて復旧可能
   - USBが無ければ adb connect のみ(端末側待受が無いと復旧不可)
 - カレントディレクトリ(=WatchDir)の APK 更新監視
   - 起動時に「最新APK」を記憶
-  - APKが更新されたら自動で adb install
+  - APKが更新されたら全ターゲットに並列で adb install
   - FileSystemWatcher取りこぼし対策としてポーリングでも検知
+- 複数Android端末対応:
+  - USB接続された全端末から自動でIPを収集してターゲット化
+  - 実行中に新規USB接続された端末も動的に対象へ追加
+  - APKインストールは全ターゲットに並列実行(ThreadJobがあれば使用、無ければStart-Jobにフォールバック)
 - ログ削減:
-  - 接続OKは「同じ1行を更新」表示
+  - 接続OKは「台数 接続OK: N/M 台」のサマリを1行更新
   - 重要イベント時のみ改行して通常ログ
 
 前提:
@@ -79,7 +83,10 @@ function Check-AdbExists {
 }
 
 # ---------- ADB helpers ----------
-function Get-UsbDeviceSerial {
+
+# USB接続されている全端末のシリアルを返す(Wi-Fi接続分は除外)
+function Get-UsbDeviceSerials {
+  $serials = @()
   $lines = & adb devices 2>$null
   foreach ($line in $lines) {
     if ($line -match '^List of devices attached') { continue }
@@ -87,10 +94,10 @@ function Get-UsbDeviceSerial {
     $parts = $line -split '\s+'
     if ($parts.Count -ge 2 -and $parts[1] -eq 'device') {
       $id = $parts[0]
-      if ($id -notmatch ':\d+$') { return $id }  # USB端末っぽい
+      if ($id -notmatch ':\d+$') { $serials += $id }  # USB端末っぽい
     }
   }
-  return $null
+  return ,$serials
 }
 
 function Get-PhoneIpFromUsb {
@@ -121,7 +128,16 @@ function Connect-Adb {
   & adb connect $Target 2>&1
 }
 
-function Ensure-Connected {
+# 指定USBシリアルが現在USB接続されているか
+function Test-UsbSerialConnected {
+  param([string]$Serial)
+  if (-not $Serial) { return $false }
+  $current = Get-UsbDeviceSerials
+  return ($current -contains $Serial)
+}
+
+# 単一ターゲットの接続確認・復旧
+function Ensure-ConnectedSingle {
   param([string]$Target, [int]$Port)
 
   if (Test-AdbConnected -Target $Target) { return $true }
@@ -129,16 +145,59 @@ function Ensure-Connected {
   Flush-StatusLine
   Write-Log "切断検知 -> 復旧処理: $Target"
 
-  $serial = Get-UsbDeviceSerial
-  if ($serial) {
-    Write-Log "USBあり: tcpip 有効化 -> connect"
-    Ensure-TcpipEnabled -Serial $serial -Port $Port | ForEach-Object { if($_){ Write-Log "  $_" } }
+  $serial = $null
+  if ($script:Targets.ContainsKey($Target)) {
+    $serial = $script:Targets[$Target].Serial
+  }
+
+  if ($serial -and (Test-UsbSerialConnected -Serial $serial)) {
+    Write-Log "  USBあり(serial=$serial): tcpip 再有効化"
+    Ensure-TcpipEnabled -Serial $serial -Port $Port | ForEach-Object { if($_){ Write-Log "    $_" } }
+    Start-Sleep -Milliseconds 500
   } else {
-    Write-Log "USBなし: connect のみ(端末側待受が無いと復旧不可)"
+    Write-Log "  USBなし: connect のみ(端末側待受が無いと復旧不可)"
   }
 
   Connect-Adb -Target $Target | ForEach-Object { if($_){ Write-Log "  $_" } }
   return (Test-AdbConnected -Target $Target)
+}
+
+# USB接続中の全端末を走査し、未知ならtcpip有効化+connectしてターゲット一覧に追加
+# 返り値: 今回追加されたターゲット数
+function Refresh-Targets {
+  param([int]$Port)
+
+  $serials = Get-UsbDeviceSerials
+  $added = 0
+  foreach ($serial in $serials) {
+    # 既に同serialを知っているターゲットがあるか
+    $alreadyKnown = $false
+    foreach ($k in @($script:Targets.Keys)) {
+      if ($script:Targets[$k].Serial -eq $serial) { $alreadyKnown = $true; break }
+    }
+    if ($alreadyKnown) { continue }
+
+    $ip = Get-PhoneIpFromUsb -Serial $serial
+    if (-not $ip) {
+      Write-Log "IP取得失敗: serial=$serial (Wi-Fi未接続の可能性)"
+      continue
+    }
+    $target = "${ip}:${Port}"
+    if ($script:Targets.ContainsKey($target)) {
+      Write-Log "警告: 既知ターゲット $target に serial=$serial が衝突"
+      continue
+    }
+
+    Write-Log "新規端末検出: serial=$serial / IP=$ip -> tcpip $Port 有効化"
+    Ensure-TcpipEnabled -Serial $serial -Port $Port | ForEach-Object { if($_){ Write-Log "  $_" } }
+    Start-Sleep -Milliseconds 500
+    Connect-Adb -Target $target | ForEach-Object { if($_){ Write-Log "  $_" } }
+
+    $script:Targets[$target] = @{ Serial = $serial; AddedAt = Get-Date }
+    Write-Log "ターゲット追加: $target (serial=$serial) / 合計 $($script:Targets.Count) 台"
+    $added++
+  }
+  return $added
 }
 
 # ---------- APK helpers ----------
@@ -171,47 +230,98 @@ function Wait-ForFileReady {
   return $false
 }
 
-function Install-Apk {
+# 複数ターゲットへの並列インストール
+function Install-ApkParallel {
   param(
     [string]$ApkPath,
-    [string]$Target,
+    [string[]]$Targets,
     [int]$Port
   )
 
-  $now = Get-Date -Format "HH:mm:ss"
   Flush-StatusLine
 
   if (-not (Test-Path $ApkPath)) {
     Write-Log "APKが見つかりません: $ApkPath"
     return
   }
-
   if (-not (Wait-ForFileReady -Path $ApkPath -TimeoutSec 60)) {
     Write-Log "APKが書き込み中っぽいので install を中断: $ApkPath"
     return
   }
-
-  if (-not (Ensure-Connected -Target $Target -Port $Port)) {
-    Write-Log "端末未接続のため install をスキップ(次回更新検知で再試行)"
+  if (-not $Targets -or $Targets.Count -eq 0) {
+    Write-Log "接続中のターゲットがないため install をスキップ(次回更新検知で再試行)"
     return
   }
 
-  Write-Log "APKインストール開始: $ApkPath"
+  $engine = if ($script:UseThreadJob) { 'ThreadJob' } else { 'Start-Job' }
+  Write-Log "APK並列インストール開始 ($($Targets.Count)台 / $engine): $ApkPath"
 
-  # 安定化: Wi-Fi ADBでstreaming失敗しやすいので --no-streaming
-  # Unityのdevelopment build等で testOnly になることがあるので -t
-  & adb -s $Target install -r -t --no-streaming -- "$ApkPath" 2>&1 |
-    ForEach-Object { if($_){ Write-Log "  $_" } }
+  $jobs = @()
+  foreach ($t in $Targets) {
+    # 並列install時、`adb install --no-streaming` は内部で `/data/local/tmp/<apkname>`
+    # という固定名で push するため、複数端末に同じローカルAPKを並列投入すると
+    # リモート一時ファイル名が衝突して一方のinstallが失敗する。
+    # 回避策として push -> pm install -> rm を自前で行い、リモート名を端末ごとに
+    # ユニーク化する。
+    $sb = {
+      param($Target, $Apk)
 
-  $exit = $LASTEXITCODE
+      $baseName = [System.IO.Path]::GetFileNameWithoutExtension($Apk)
+      $uniqueId = [Guid]::NewGuid().ToString('N').Substring(0, 8)
+      $remotePath = "/data/local/tmp/installtmp_${baseName}_${uniqueId}.apk"
 
-  # Windows標準サウンドで通知
+      $out = @()
+
+      # 1) push
+      $pushOut = & adb -s $Target push "$Apk" $remotePath 2>&1
+      $pushExit = $LASTEXITCODE
+      foreach ($l in $pushOut) { if ($l) { $out += "[push] $l" } }
+      if ($pushExit -ne 0) {
+        return [PSCustomObject]@{ Target = $Target; Success = $false; Output = $out; Stage = 'push' }
+      }
+
+      # 2) pm install (-r: 再インストール, -t: testOnly許可)
+      # `adb shell pm install` は exit code が 0 になりがちなので出力で Success 判定する
+      $installOut = & adb -s $Target shell pm install -r -t "$remotePath" 2>&1
+      foreach ($l in $installOut) { if ($l) { $out += "[install] $l" } }
+      $installSuccess = $false
+      foreach ($l in $installOut) { if ($l -match '^Success') { $installSuccess = $true; break } }
+
+      # 3) rm (後片付け)
+      $rmOut = & adb -s $Target shell rm -f "$remotePath" 2>&1
+      foreach ($l in $rmOut) { if ($l) { $out += "[rm] $l" } }
+
+      [PSCustomObject]@{ Target = $Target; Success = $installSuccess; Output = $out; Stage = 'install' }
+    }
+    if ($script:UseThreadJob) {
+      $jobs += Start-ThreadJob -ScriptBlock $sb -ArgumentList $t, $ApkPath
+    } else {
+      $jobs += Start-Job -ScriptBlock $sb -ArgumentList $t, $ApkPath
+    }
+  }
+
+  $results = $jobs | Wait-Job | Receive-Job
+  $jobs | Remove-Job -Force -ErrorAction SilentlyContinue
+
+  $success = 0
+  $fail = 0
+  foreach ($r in $results) {
+    foreach ($line in $r.Output) { if ($line) { Write-Log "  [$($r.Target)] $line" } }
+    if ($r.Success) {
+      Write-Log "[$($r.Target)] APKインストール成功"
+      $success++
+    } else {
+      Write-Log "[$($r.Target)] APKインストール失敗(stage=$($r.Stage))"
+      $fail++
+    }
+  }
+
+  Write-Log "並列インストール結果: 成功=$success / 失敗=$fail / 合計=$($Targets.Count)"
+
   try {
-    if ($exit -eq 0) {
-      Write-Log "APKインストール成功($exit)"
+    if ($fail -eq 0) {
       [System.Media.SystemSounds]::Asterisk.Play()
     } else {
-      Write-Log "APKインストール失敗($exit)"
       [System.Media.SystemSounds]::Hand.Play()
     }
   } catch { }
@@ -219,7 +329,7 @@ function Install-Apk {
 
 # ---------- main ----------
 Write-Host "======================================"
-Write-Host " ADB Wi-Fi Auto Install"
+Write-Host " ADB Wi-Fi Auto Install (multi-device)"
 Write-Host " WatchDir: $WatchDir"
 Write-Host " Filter  : $ApkFilter"
 Write-Host " Interval: ${IntervalSec}s / Port: $Port"
@@ -229,21 +339,28 @@ Write-Host "======================================"
 # ADB 存在チェック（警告を出す）
 Check-AdbExists
 
-# 接続先(target)確定:USBからIP取得
-$target = $null
-while (-not $target) {
-  $serial = Get-UsbDeviceSerial
-  if ($serial) {
-    $ip = Get-PhoneIpFromUsb -Serial $serial
-    if ($ip) {
-      $target = "$ip`:$Port"
-      Write-Log "接続先確定: $target (USB: $serial / IP: $ip)"
-      break
-    }
-  }
-  Write-Log "USBからIP取得できないので待機中…(USB接続+デバッグ許可を確認)"
-  Start-Sleep -Seconds 2
+# 並列実行エンジン選択: ThreadJobがあれば使う、無ければStart-Job
+try { Import-Module ThreadJob -ErrorAction SilentlyContinue } catch { }
+$script:UseThreadJob = [bool](Get-Command Start-ThreadJob -ErrorAction SilentlyContinue)
+if ($script:UseThreadJob) {
+  Write-Log "並列実行エンジン: ThreadJob 使用"
+} else {
+  Write-Log "並列実行エンジン: Start-Job 使用 (ThreadJob 未検出)"
 }
+
+# ターゲット管理 (key: "ip:port", value: @{Serial; AddedAt})
+$script:Targets = @{}
+$script:ForcePollNow = $false
+
+# 接続先(target)確定: 最低1台見つかるまで待機
+while ($script:Targets.Count -eq 0) {
+  Refresh-Targets -Port $Port | Out-Null
+  if ($script:Targets.Count -eq 0) {
+    Write-Log "USB接続されてIPが取れる端末がありません。待機中…(USB接続+デバッグ許可+Wi-Fi接続を確認)"
+    Start-Sleep -Seconds 2
+  }
+}
+Write-Log "初期ターゲット: $($script:Targets.Count) 台 ($((($script:Targets.Keys) | Sort-Object) -join ', '))"
 
 # 起動時:最新APKを記憶
 $latest = Get-LatestApk -Dir $WatchDir -Filter $ApkFilter
@@ -268,17 +385,10 @@ $action = {
   } catch { }
 }
 
-# タイマーElapsed:最新APKを見直して署名が変わっていればinstall
+# タイマーElapsed: 次回のメインループでAPKチェックを強制する
+# (実際のsig比較とinstallはメインループ側で実施 ― race condition回避のため)
 Register-ObjectEvent -InputObject $timer -EventName Elapsed -Action {
-  $latest = Get-LatestApk -Dir $using:WatchDir -Filter $using:ApkFilter
-  if (-not $latest) { return }
-
-  $sig = Get-ApkSignature -FileInfo $latest
-  if ($sig -ne $script:KnownApkSig) {
-    $script:KnownApkSig = $sig
-    Write-Log "APK更新検知(event): $([System.IO.Path]::GetFileName($latest.FullName)) ($($latest.LastWriteTimeUtc.ToLocalTime().ToString([System.Globalization.CultureInfo]::CurrentCulture)) / $($latest.Length) bytes)"
-    Install-Apk -ApkPath $latest.FullName -Target $using:target -Port $using:Port
-  }
+  $script:ForcePollNow = $true
 } | Out-Null
 
 # FileSystemWatcher
@@ -299,21 +409,43 @@ $swPoll = [Diagnostics.Stopwatch]::StartNew()
 while ($true) {
   $now = Get-Date -Format "HH:mm:ss"
 
-  # 1) ADB watchdog(接続OKは1行更新)
+  # 0) 動的ターゲット追加: USB新規接続の検出
   try {
-    if (Test-AdbConnected -Target $target) {
-      if ($script:ConnectedSince -eq $null) { $script:ConnectedSince = $now }
-      Write-StatusLine ("[{0}] 接続OK: {1} (last update: {2})" -f $script:ConnectedSince, $target, $now)
-    } else {
-      $script:ConnectedSince = $null
-      Ensure-Connected -Target $target -Port $Port | Out-Null
-    }
+    Refresh-Targets -Port $Port | Out-Null
   } catch {
-    Write-Log "adb 実行エラー: $($_.Exception.Message)"
+    Write-Log "Refresh-Targets エラー: $($_.Exception.Message)"
   }
 
-  # 2) APKポーリング(保険):一定間隔で最新APKの署名を見直す
-  if ($swPoll.Elapsed.TotalSeconds -ge $PollApkEverySec) {
+  # 1) 各ターゲットの接続チェック + 切断時の復旧試行
+  $okCount = 0
+  $total = $script:Targets.Count
+  foreach ($t in @($script:Targets.Keys)) {
+    try {
+      if (Test-AdbConnected -Target $t) {
+        $okCount++
+      } else {
+        Ensure-ConnectedSingle -Target $t -Port $Port | Out-Null
+      }
+    } catch {
+      Write-Log "adb チェックエラー($t): $($_.Exception.Message)"
+    }
+  }
+
+  # ステータス1行更新
+  if ($total -gt 0 -and $okCount -eq $total) {
+    if ($null -eq $script:ConnectedSince) { $script:ConnectedSince = $now }
+    $since = $script:ConnectedSince
+    Write-StatusLine ("[{0}] 接続OK: {1}/{2} 台 (last update: {3})" -f $since, $okCount, $total, $now)
+  } else {
+    $script:ConnectedSince = $null
+    Write-StatusLine ("[{0}] 接続OK: {1}/{2} 台 (last update: {0})" -f $now, $okCount, $total)
+  }
+
+  # 2) APKチェック(FSWイベント or 定期ポーリング)
+  $shouldCheck = $script:ForcePollNow -or ($swPoll.Elapsed.TotalSeconds -ge $PollApkEverySec)
+  if ($shouldCheck) {
+    $source = if ($script:ForcePollNow) { 'event' } else { 'polling' }
+    $script:ForcePollNow = $false
     $swPoll.Restart()
     try {
       $latest = Get-LatestApk -Dir $WatchDir -Filter $ApkFilter
@@ -321,8 +453,14 @@ while ($true) {
         $sig = Get-ApkSignature -FileInfo $latest
         if ($sig -ne $script:KnownApkSig) {
           $script:KnownApkSig = $sig
-          Write-Log "APK更新検知(polling): $([System.IO.Path]::GetFileName($latest.FullName)) ($($latest.LastWriteTimeUtc.ToLocalTime().ToString([System.Globalization.CultureInfo]::CurrentCulture)) / $($latest.Length) bytes)"
-          Install-Apk -ApkPath $latest.FullName -Target $target -Port $Port
+          Write-Log "APK更新検知($source): $([System.IO.Path]::GetFileName($latest.FullName)) ($($latest.LastWriteTimeUtc.ToLocalTime().ToString([System.Globalization.CultureInfo]::CurrentCulture)) / $($latest.Length) bytes)"
+
+          # 接続OKなターゲットだけに並列install
+          $aliveTargets = @()
+          foreach ($t in @($script:Targets.Keys)) {
+            if (Test-AdbConnected -Target $t) { $aliveTargets += $t }
+          }
+          Install-ApkParallel -ApkPath $latest.FullName -Targets $aliveTargets -Port $Port
         }
       }
     } catch {
