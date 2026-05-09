@@ -140,10 +140,17 @@ function Test-UsbSerialConnected {
 function Ensure-ConnectedSingle {
   param([string]$Target, [int]$Port)
 
-  if (Test-AdbConnected -Target $Target) { return $true }
+  if (Test-AdbConnected -Target $Target) {
+    $script:ReconnectFailedTargets.Remove($Target)
+    return $true
+  }
 
-  Flush-StatusLine
-  Write-Log "切断検知 -> 復旧処理: $Target"
+  $alreadyFailing = $script:ReconnectFailedTargets.ContainsKey($Target)
+
+  if (-not $alreadyFailing) {
+    Flush-StatusLine
+    Write-Log "切断検知 -> 復旧処理: $Target"
+  }
 
   $serial = $null
   if ($script:Targets.ContainsKey($Target)) {
@@ -151,15 +158,25 @@ function Ensure-ConnectedSingle {
   }
 
   if ($serial -and (Test-UsbSerialConnected -Serial $serial)) {
-    Write-Log "  USBあり(serial=$serial): tcpip 再有効化"
-    Ensure-TcpipEnabled -Serial $serial -Port $Port | ForEach-Object { if($_){ Write-Log "    $_" } }
+    if (-not $alreadyFailing) { Write-Log "  USBあり(serial=$serial): tcpip 再有効化" }
+    Ensure-TcpipEnabled -Serial $serial -Port $Port | Out-Null
     Start-Sleep -Milliseconds 500
   } else {
-    Write-Log "  USBなし: connect のみ(端末側待受が無いと復旧不可)"
+    if (-not $alreadyFailing) { Write-Log "  USBなし: connect のみ(端末側待受が無いと復旧不可)" }
   }
 
-  Connect-Adb -Target $Target | ForEach-Object { if($_){ Write-Log "  $_" } }
-  return (Test-AdbConnected -Target $Target)
+  Connect-Adb -Target $Target | Out-Null
+  $connected = Test-AdbConnected -Target $Target
+
+  if ($connected) {
+    if ($alreadyFailing) {
+      Write-Log "復旧成功: $Target"
+    }
+    $script:ReconnectFailedTargets.Remove($Target)
+  } else {
+    $script:ReconnectFailedTargets[$Target] = $true
+  }
+  return $connected
 }
 
 # USB接続中の全端末を走査し、未知ならtcpip有効化+connectしてターゲット一覧に追加
@@ -179,9 +196,13 @@ function Refresh-Targets {
 
     $ip = Get-PhoneIpFromUsb -Serial $serial
     if (-not $ip) {
-      Write-Log "IP取得失敗: serial=$serial (Wi-Fi未接続の可能性)"
+      if (-not $script:IpFailedSerials.ContainsKey($serial)) {
+        Write-Log "IP取得失敗: serial=$serial (Wi-Fi未接続の可能性)"
+        $script:IpFailedSerials[$serial] = $true
+      }
       continue
     }
+    $script:IpFailedSerials.Remove($serial)
     $target = "${ip}:${Port}"
     if ($script:Targets.ContainsKey($target)) {
       Write-Log "警告: 既知ターゲット $target に serial=$serial が衝突"
@@ -351,12 +372,18 @@ if ($script:UseThreadJob) {
 # ターゲット管理 (key: "ip:port", value: @{Serial; AddedAt})
 $script:Targets = @{}
 $script:ForcePollNow = $false
+$script:IpFailedSerials = @{}
+$script:ReconnectFailedTargets = @{}
 
 # 接続先(target)確定: 最低1台見つかるまで待機
+$waitMsgShown = $false
 while ($script:Targets.Count -eq 0) {
   Refresh-Targets -Port $Port | Out-Null
   if ($script:Targets.Count -eq 0) {
-    Write-Log "USB接続されてIPが取れる端末がありません。待機中…(USB接続+デバッグ許可+Wi-Fi接続を確認)"
+    if (-not $waitMsgShown) {
+      Write-Log "USB接続されてIPが取れる端末がありません。待機中…(USB接続+デバッグ許可+Wi-Fi接続を確認)"
+      $waitMsgShown = $true
+    }
     Start-Sleep -Seconds 2
   }
 }
