@@ -1,0 +1,8 @@
+# device_nicknames.txt
+# Format: SERIAL=Nickname
+# Lines starting with # are ignored.
+# Update this when you add new devices or change nicknames in MQDH.
+#
+# Example:
+# 2G0YC1ZG3P01QW=Meta Quest 3 (vanilla)
+# 192.168.1.100:5555=Meta Quest 3 (wifi)

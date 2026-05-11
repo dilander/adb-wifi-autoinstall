@@ -1,0 +1,6 @@
+# Runtime artifacts
+Logs/
+logcat_pids.txt
+
+# Local device mapping (per-PC / per-developer)
+device_nicknames.txt

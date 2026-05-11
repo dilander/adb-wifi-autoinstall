@@ -1,119 +1,177 @@
-# ADB Wi‑Fi Auto Install (adb-wifi-autoinstall)
+# ADB Utilities for Unity Android Development
 
-このリポジトリには、Wi‑Fi経由のADB接続を監視しつつ、監視ディレクトリに出力される最新の APK を自動で端末にインストールする PowerShell スクリプト `adb-wifi-autoinstall.ps1` が含まれます。**複数のAndroid端末への同時インストール**に対応しており、USBで接続された全端末を自動でターゲット化し、APK更新時に並列でインストールします。
+Unity Android 開発者向けの ADB ユーティリティ集です。APK の自動インストールと、複数端末の logcat 記録を提供します。
 
-主に XREAL 向け Unity 開発者（Wi‑Fi 経由で ADB 接続を維持しつつ、ビルドとインストールは行いたいが Unity の Run を実行したくない方）を想定しています。
+| ユーティリティ | スクリプト | 用途 |
+|---|---|---|
+| **Wi-Fi Auto Install** | `adb-wifi-autoinstall.ps1` | Wi-Fi ADB 接続を維持しつつ、APK 更新を検知して全端末へ自動インストール |
+| **Multi-device Logcat Recorder** | `start_logcat.ps1` / `stop_logcat.ps1` | 接続中の全端末から Unity タグの logcat をデバイス別ファイルにバックグラウンド記録 |
+
+両者は相補的に使えます: APK を自動インストール → アプリ再起動 → logcat で挙動確認、というワークフローです。
 
 ---
 
 ## 目次
 
-- [概要](#概要)
-- [想定ユーザー](#想定ユーザー)
-- [機能](#機能)
-- [前提・動作環境](#前提・動作環境)
-- [使い方（クイックスタート）](#使い方クイックスタート)
-- [設定（パラメータ）](#設定パラメータ)
-- [出力・ログ](#出力ログ)
+- [前提・動作環境](#前提動作環境)
+- [Wi-Fi Auto Install](#wi-fi-auto-install)
+  - [概要](#概要)
+  - [使い方](#使い方)
+  - [設定（パラメータ）](#設定パラメータ)
+  - [出力・ログ](#出力ログ)
+- [Multi-device Logcat Recorder](#multi-device-logcat-recorder)
+  - [概要](#概要-1)
+  - [使い方](#使い方-1)
+  - [デバイスニックネーム](#デバイスニックネーム)
+  - [仕組み](#仕組み)
 - [セキュリティ・注意事項](#セキュリティ注意事項)
 - [AI 生成についての明示](#ai-生成についての明示)
 - [貢献・ライセンス](#貢献ライセンス)
 
 ---
 
-## 概要
-
-`adb-wifi-autoinstall.ps1` は以下の要素を組み合わせたユーティリティです。
-
-- ADB 接続のウォッチドッグ: 端末が切断された場合、自動で再接続を試みます（USB が接続されている場合は `adb tcpip` を使って復旧を試行します）。
-- 複数端末対応: 起動時および実行中に USB 接続された全 Android 端末を自動で収集し、Wi‑Fi ADB のターゲットとして管理します。途中で USB 接続された端末も動的に取り込みます。
-- APK 更新監視: 指定ディレクトリの最新 APK を監視し、更新があれば全ターゲットへ**並列で** `adb install` 相当の処理を実行します（`push` → `pm install` → `rm` に分解してリモート一時ファイル名を端末ごとにユニーク化）。
-- FileSystemWatcher の取りこぼし対策としてポーリングを実装。
-- ログは重要イベントのみ改行して出力し、接続状態は `接続OK: N/M 台` のサマリを同一行で上書き表示することでログノイズを抑えます。
-
-## 想定ユーザー
-
-- XREAL 向けやその他 Android ヘッドセットの Unity 開発者
-- Wi‑Fi 経由で ADB を使ってデバッグ/インストールしたいが、Unity Editor の Run（Play）を使わずに外部でビルド→インストールを回したい方
-
-## 機能
-
-- ADB 接続監視と自動復旧（USB 接続がある場合は tcpip を有効化して復旧を試行）
-- **複数 Android 端末への同時対応**: USB 接続された全端末から IP を自動収集してターゲット化
-- **動的な端末追加**: 実行中に新たに USB 接続された端末も自動でターゲットに追加
-- **並列インストール**: APK 更新時、全接続中ターゲットへ並列で install 実行（`ThreadJob` があれば使用、無ければ `Start-Job` にフォールバック）
-- リモート一時ファイル名のユニーク化により、並列時の `/data/local/tmp/` 衝突を回避
-- 指定フォルダ（デフォルトはスクリプト起動ディレクトリ）の APK 更新検出 → 自動インストール
-- FileSystemWatcher + ポーリングの二重検知で検出精度を向上
-- `接続OK: N/M 台` のサマリ表示（同一行更新）と、重要イベントのみ改行ログ
-- インストール結果に応じて音で通知（Windows 標準音。1台でも失敗すれば失敗音）
-
 ## 前提・動作環境
 
 - Windows（PowerShell 5.1 以上）
-- adb が PATH に通っていること（adb が利用可能であること）
+- `adb` が PATH に通っていること
 - 対象端末の USB デバッグが有効であること
-- 初回は USB 接続で各端末の IP を取得できること（tcpip 有効化のため）
-- 並列実行をスレッドベースにしたい場合は `ThreadJob` モジュールを推奨（未導入でも `Start-Job` でフォールバック動作します）
-
-## 使い方（クイックスタート）
-
-1. このリポジトリをクローンまたはダウンロードして作業ディレクトリに移動します。
-2. PowerShell を管理者で開く必要はほとんどありませんが、ExecutionPolicy によってはスクリプト実行を許可する必要があります。
-3. スクリプトを実行します（例）:
-
-```powershell
-# スクリプトをカレントディレクトリで実行
-powershell -ExecutionPolicy Bypass -File "adb-wifi-autoinstall.ps1"
-
-# 別パラメータで実行する例
-powershell -ExecutionPolicy Bypass -File "adb-wifi-autoinstall.ps1" -Port 5555 -WatchDir "C:\path\to\apk_dir" -ApkFilter "*.apk" -IntervalSec 5
-```
-
-実行後、WatchDir にある最新の APK をスクリプトが記憶し、以降の更新を検出して自動で端末へインストールします。
-
-## 設定（パラメータ）
-
-スクリプトのパラメータ（デフォルト）：
-
-- Port (int) = 5555 — adb tcpip 用ポート
-- IntervalSec (int) = 5 — ADB ウォッチドッグやメインループの待機間隔（秒）
-- WatchDir (string) = スクリプト起動ディレクトリ — APK を監視するディレクトリ
-- ApkFilter (string) = "*.apk" — 監視するファイルのフィルタ
-- DebounceMs (int) = 1200 — FileSystemWatcher のデバウンス時間（ミリ秒）
-- PollApkEverySec (int) = 5 — ポーリング間隔（秒）
-
-コマンドラインからパラメータを指定して上書きできます（上の実行例参照）。
-
-## 出力・ログ
-
-- 接続状態は `接続OK: N/M 台 (last update: HH:mm:ss)` の形式で同一行を上書きして表示されます（N = 接続中ターゲット数 / M = 認識済みターゲット総数）。
-- 重要イベント（新規端末検出、ターゲット追加、接続失敗、接続復旧、APK 更新検知、各端末のインストール結果、並列インストール結果サマリなど）はタイムスタンプ付きで改行して出力されます。
-- 並列インストール時の各端末ごとのログは `  [ip:port] ...` のようにターゲット付きでインデント表示されます。
-- インストール結果は最後に `並列インストール結果: 成功=X / 失敗=Y / 合計=Z` として集約表示します。
-- インストール成功/失敗時に Windows のシステム音で通知します（全台成功なら Asterisk、1台でも失敗なら Hand）。
-
-## セキュリティ・注意事項
-
-- このスクリプトは端末の adb インタフェースを操作します。公開環境や不特定多数が接続するネットワーク上での運用には十分注意してください。
-- 自動インストールを行うため、誤った APK をインストールしてしまうリスクがあります。監視ディレクトリの管理は慎重に行ってください。
-- スクリプトを配布・実運用する前に必ずコードレビューとテストを行ってください。
-
-## AI 生成についての明示
-
-このリポジトリ内の一部ファイル（例: `adb-wifi-autoinstall.ps1`）には、AI（生成モデル）による生成または編集支援が含まれています。
-
-- 影響: AI 支援により実装とドキュメントが作成されていますが、最終的なレビュー、テスト、運用判断は人間の担当者が行ってください。
-- 表示例（スクリプト内にも同様の注記を含めています）: "このファイルにはAI（生成モデル）による生成または編集支援が含まれます。"
-
-この明示は、AI による自動生成であることを利用者に透明に伝える目的で含めています。
-
-## 貢献・ライセンス
-
-- バグ修正や改善提案は Pull Request を通して歓迎します。小さな改善（ドキュメントの改善、パラメータ追加など）は PR で送ってください。
-- ライセンスファイルが同梱されていない場合は、配布方針に応じて `LICENSE` を追加してください（MIT などの緩いライセンスを採用する場合が多いです）。
 
 ---
 
-必要なら、この README に英訳版や、Windows 以外（macOS / Linux）での運用メモ、CI 自動ビルドや GitHub Actions による APK 配布フローの例などを追加します。要望があれば追記します。
+## Wi-Fi Auto Install
 
+### 概要
+
+`adb-wifi-autoinstall.ps1` は以下を組み合わせたユーティリティです。
+
+- **ADB 接続ウォッチドッグ**: 端末が切断された場合、自動で再接続を試みます（USB 接続時は `adb tcpip` で復旧を試行）
+- **複数端末対応**: USB 接続された全 Android 端末を自動で収集し、Wi-Fi ADB のターゲットとして管理。実行中に接続された端末も動的に取り込みます
+- **APK 更新監視**: 指定ディレクトリの最新 APK を監視し、更新があれば全ターゲットへ並列で `adb install` を実行（FileSystemWatcher + ポーリングの二重検知）
+- **音声通知**: インストール結果に応じて Windows システム音で通知（全台成功なら Asterisk、1台でも失敗なら Hand）
+
+初回は USB 接続で各端末の IP を取得する必要があります（`adb tcpip` 有効化のため）。
+
+主に XREAL 向け Unity 開発者（Wi-Fi 経由で ADB 接続を維持しつつ、Unity の Run を使わずにビルド→インストールを回したい方）を想定しています。
+
+### 使い方
+
+```powershell
+# バッチファイルから実行（推奨）
+adb-wifi-autoinstall.bat
+
+# PowerShell から直接実行
+powershell -ExecutionPolicy Bypass -File "adb-wifi-autoinstall.ps1"
+
+# パラメータ指定の例
+powershell -ExecutionPolicy Bypass -File "adb-wifi-autoinstall.ps1" -Port 5555 -WatchDir "C:\path\to\apk_dir" -ApkFilter "*.apk" -IntervalSec 5
+```
+
+### 設定（パラメータ）
+
+| パラメータ | デフォルト | 説明 |
+|---|---|---|
+| `Port` | 5555 | adb tcpip 用ポート |
+| `IntervalSec` | 5 | ウォッチドッグ・メインループの待機間隔（秒） |
+| `WatchDir` | スクリプト起動ディレクトリ | APK を監視するディレクトリ |
+| `ApkFilter` | `*.apk` | 監視するファイルのフィルタ |
+| `DebounceMs` | 1200 | FileSystemWatcher のデバウンス時間（ミリ秒） |
+| `PollApkEverySec` | 5 | ポーリング間隔（秒） |
+
+### 出力・ログ
+
+- 接続状態は `接続OK: N/M 台 (last update: HH:mm:ss)` の形式で同一行上書き表示
+- 重要イベント（端末検出、接続失敗/復旧、APK 更新検知、インストール結果など）はタイムスタンプ付きで改行出力
+- 並列インストール結果は `並列インストール結果: 成功=X / 失敗=Y / 合計=Z` として集約表示
+
+---
+
+## Multi-device Logcat Recorder
+
+### 概要
+
+PC に接続中の全 Android 端末（Meta Quest 等）から、**デバイス別ファイル**に Unity タグの logcat をバックグラウンド記録します。
+
+- 接続中の全端末を自動検出
+- 端末ごとに非表示の `cmd.exe` プロセスで `adb logcat` を実行
+- ログは `Logs\<デバイス名>_unity.log` に出力
+- Ctrl+C で graceful に停止し、バッファを確実にフラッシュ
+- 2重起動防止機能付き
+
+### 使い方
+
+**開始:**
+
+```powershell
+# バッチファイルから実行（推奨）
+start_logcat.bat
+
+# PowerShell から直接実行
+powershell -ExecutionPolicy Bypass -File "start_logcat.ps1"
+```
+
+**停止:**
+
+実行中のターミナルで **Ctrl+C** を押してください。graceful に停止し、ログバッファがフラッシュされます。
+
+Ctrl+C が使えない場合（ターミナルが応答しない等）はフォールバック用の停止スクリプトを使います:
+
+```powershell
+stop_logcat.bat
+```
+
+**出力例:**
+
+```
+Starting logcat for 2 device(s) (hidden)...
+
+  [Meta_Quest_3_vanilla] pid=56240  ->  Logs\Meta_Quest_3_vanilla_unity.log
+  [192.168.1.100_5555]   pid=58488  ->  Logs\192.168.1.100_5555_unity.log
+
+Recording. Press Ctrl+C to stop and flush.
+```
+
+### デバイスニックネーム
+
+デフォルトでは ADB シリアル番号がそのままログファイル名に使われます。分かりやすい名前を付けたい場合は、`device_nicknames.txt.example` をコピーして `device_nicknames.txt` を作成し、マッピングを記述してください。
+
+```powershell
+copy device_nicknames.txt.example device_nicknames.txt
+```
+
+フォーマット:
+
+```
+SERIAL=Nickname
+```
+
+例:
+
+```
+2G0YC1ZG3P01QW=Meta Quest 3 (vanilla)
+192.168.1.100:5555=Meta Quest 3 (wifi)
+```
+
+`device_nicknames.txt` は `.gitignore` 対象のため、各開発者が自分の環境に合わせて編集します。
+
+### 仕組み
+
+- `start_logcat.ps1` が `adb devices` で接続端末を列挙し、端末ごとに非表示の `cmd.exe` プロセスを起動して `adb logcat -v threadtime -s Unity > ログファイル` を実行します
+- 停止時は `taskkill /PID`（`/F` なし）で WM_CLOSE → CTRL_CLOSE_EVENT を送り、adb の CRT が stdio バッファをフラッシュしてからプロセスが終了します。これにより確実にログが書き出されます
+- 5秒以内に終了しない場合のみ `/F` で強制 kill します（ログが途切れる可能性あり）
+
+---
+
+## セキュリティ・注意事項
+
+- これらのスクリプトは端末の ADB インタフェースを操作します。公開環境や不特定多数が接続するネットワーク上での運用には十分注意してください
+- 自動インストール機能を使う場合、誤った APK をインストールするリスクがあります。監視ディレクトリの管理は慎重に行ってください
+- スクリプトを配布・実運用する前に必ずコードレビューとテストを行ってください
+
+## AI 生成についての明示
+
+このリポジトリ内のファイルには、AI（生成モデル）による生成または編集支援が含まれています。最終的なレビュー、テスト、運用判断は人間の担当者が行ってください。
+
+## 貢献・ライセンス
+
+- バグ修正や改善提案は Issue または Pull Request で歓迎します
+- ライセンスについては [LICENSE](LICENSE) を参照してください
