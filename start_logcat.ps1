@@ -52,13 +52,15 @@ if ($devices.Count -eq 0) {
     exit 1
 }
 
+$timestamp = Get-Date -Format 'yyyyMMdd_HHmmss'
+
 Write-Host "Starting logcat for $($devices.Count) device(s) (hidden)..."
 Write-Host ""
 
 $started = @()
 foreach ($serial in $devices) {
     $nickname = Resolve-Nickname $serial
-    $logFile = Join-Path 'Logs' "${nickname}_unity.log"
+    $logFile = Join-Path 'Logs' "${nickname}_unity_${timestamp}.log"
 
     & adb -s $serial logcat -c 2>$null | Out-Null
 
