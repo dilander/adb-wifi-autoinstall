@@ -9,7 +9,7 @@ adb-wifi-autoinstall.ps1
 - カレントディレクトリ(=WatchDir)の APK 更新監視
   - 起動時に「最新APK」を記憶
   - APKが更新されたら全ターゲットに並列で adb install
-  - FileSystemWatcher取りこぼし対策としてポーリングでも検知
+  - 一定間隔(PollApkEverySec)のポーリングで更新を検知
 - 複数Android端末対応:
   - USB接続された全端末から自動でIPを収集してターゲット化
   - 実行中に新規USB接続された端末も動的に対象へ追加
@@ -28,7 +28,6 @@ param(
   [int]$IntervalSec = 5,
   [string]$WatchDir = (Get-Location).Path,
   [string]$ApkFilter = "*.apk",
-  [int]$DebounceMs = 1200,
   [int]$PollApkEverySec = 5
 )
 
@@ -371,7 +370,6 @@ if ($script:UseThreadJob) {
 
 # ターゲット管理 (key: "ip:port", value: @{Serial; AddedAt})
 $script:Targets = @{}
-$script:ForcePollNow = $false
 $script:IpFailedSerials = @{}
 $script:ReconnectFailedTargets = @{}
 
@@ -398,39 +396,7 @@ if ($latest) {
   Write-Log "APKがまだありません(監視は継続)"
 }
 
-# debounce用タイマー(イベント連打をまとめる)
-$timer = New-Object System.Timers.Timer
-$timer.Interval = $DebounceMs
-$timer.AutoReset = $false
-
-# 監視イベント(Created/Changed/Renamed)の共通Action:debounce
-$action = {
-  try {
-    $t = $using:timer
-    $t.Stop()
-    $t.Start()
-  } catch { }
-}
-
-# タイマーElapsed: 次回のメインループでAPKチェックを強制する
-# (実際のsig比較とinstallはメインループ側で実施 ― race condition回避のため)
-Register-ObjectEvent -InputObject $timer -EventName Elapsed -Action {
-  $script:ForcePollNow = $true
-} | Out-Null
-
-# FileSystemWatcher
-$fsw = New-Object System.IO.FileSystemWatcher
-$fsw.Path = $WatchDir
-$fsw.Filter = $ApkFilter
-$fsw.IncludeSubdirectories = $false
-$fsw.NotifyFilter = [System.IO.NotifyFilters]'FileName, LastWrite, Size, CreationTime'
-
-Register-ObjectEvent $fsw Created -Action $action | Out-Null
-Register-ObjectEvent $fsw Changed -Action $action | Out-Null
-Register-ObjectEvent $fsw Renamed -Action $action | Out-Null
-$fsw.EnableRaisingEvents = $true
-
-# ポーリング用(イベント取りこぼし対策)
+# APKチェック間隔(PollApkEverySec)の経過時間計測用
 $swPoll = [Diagnostics.Stopwatch]::StartNew()
 
 while ($true) {
@@ -468,11 +434,8 @@ while ($true) {
     Write-StatusLine ("[{0}] 接続OK: {1}/{2} 台 (last update: {0})" -f $now, $okCount, $total)
   }
 
-  # 2) APKチェック(FSWイベント or 定期ポーリング)
-  $shouldCheck = $script:ForcePollNow -or ($swPoll.Elapsed.TotalSeconds -ge $PollApkEverySec)
-  if ($shouldCheck) {
-    $source = if ($script:ForcePollNow) { 'event' } else { 'polling' }
-    $script:ForcePollNow = $false
+  # 2) APKチェック(定期ポーリング)
+  if ($swPoll.Elapsed.TotalSeconds -ge $PollApkEverySec) {
     $swPoll.Restart()
     try {
       $latest = Get-LatestApk -Dir $WatchDir -Filter $ApkFilter
@@ -480,7 +443,7 @@ while ($true) {
         $sig = Get-ApkSignature -FileInfo $latest
         if ($sig -ne $script:KnownApkSig) {
           $script:KnownApkSig = $sig
-          Write-Log "APK更新検知($source): $([System.IO.Path]::GetFileName($latest.FullName)) ($($latest.LastWriteTimeUtc.ToLocalTime().ToString([System.Globalization.CultureInfo]::CurrentCulture)) / $($latest.Length) bytes)"
+          Write-Log "APK更新検知: $([System.IO.Path]::GetFileName($latest.FullName)) ($($latest.LastWriteTimeUtc.ToLocalTime().ToString([System.Globalization.CultureInfo]::CurrentCulture)) / $($latest.Length) bytes)"
 
           # 接続OKなターゲットだけに並列install
           $aliveTargets = @()

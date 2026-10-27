@@ -46,7 +46,7 @@ Unity Android 開発者向けの ADB ユーティリティ集です。APK の自
 
 - **ADB 接続ウォッチドッグ**: 端末が切断された場合、自動で再接続を試みます（USB 接続時は `adb tcpip` で復旧を試行）
 - **複数端末対応**: USB 接続された全 Android 端末を自動で収集し、Wi-Fi ADB のターゲットとして管理。実行中に接続された端末も動的に取り込みます
-- **APK 更新監視**: 指定ディレクトリの最新 APK を監視し、更新があれば全ターゲットへ並列で `adb install` を実行（FileSystemWatcher + ポーリングの二重検知）
+- **APK 更新監視**: 指定ディレクトリの最新 APK を監視し、更新があれば全ターゲットへ並列で `adb install` を実行（一定間隔のポーリングで検知）
 - **音声通知**: インストール結果に応じて Windows システム音で通知（全台成功なら Asterisk、1台でも失敗なら Hand）
 
 初回は USB 接続で各端末の IP を取得する必要があります（`adb tcpip` 有効化のため）。
@@ -74,8 +74,7 @@ powershell -ExecutionPolicy Bypass -File "adb-wifi-autoinstall.ps1" -Port 5555 -
 | `IntervalSec` | 5 | ウォッチドッグ・メインループの待機間隔（秒） |
 | `WatchDir` | スクリプト起動ディレクトリ | APK を監視するディレクトリ |
 | `ApkFilter` | `*.apk` | 監視するファイルのフィルタ |
-| `DebounceMs` | 1200 | FileSystemWatcher のデバウンス時間（ミリ秒） |
-| `PollApkEverySec` | 5 | ポーリング間隔（秒） |
+| `PollApkEverySec` | 5 | APK 更新チェックのポーリング間隔（秒）。チェックはメインループの周回ごとにしか行わないため、実際の間隔は `IntervalSec` のおおむね倍数に切り上がる（`IntervalSec` より小さくしても速くならない） |
 
 ### 出力・ログ
 
