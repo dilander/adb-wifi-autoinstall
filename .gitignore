@@ -4,3 +4,6 @@ logcat_pids.txt
 
 # Local device mapping (per-PC / per-developer)
 device_nicknames.txt
+
+# Agent scratch / tool outputs (cleaned by tmp-janitor.json)
+tmp/
