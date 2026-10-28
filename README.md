@@ -92,7 +92,7 @@ PC に接続中の全 Android 端末（Meta Quest 等）から、**デバイス�
 
 - 接続中の全端末を自動検出
 - 端末ごとに非表示の `cmd.exe` プロセスで `adb logcat` を実行
-- ログは `Logs\<デバイス名>_unity.log` に出力
+- ログは `Logs\<デバイス名>_unity_<yyyyMMdd_HHmmss>.log` に出力（タイムスタンプは記録開始時刻で秒単位。起動ごとに別ファイルになる。ただし同じ秒に起動し直すと同じ名前になって上書きされ、ニックネームが重なる端末は同じファイルに書き込まれる）
 - Ctrl+C で graceful に停止し、バッファを確実にフラッシュ
 - 2重起動防止機能付き
 
@@ -123,15 +123,15 @@ stop_logcat.bat
 ```
 Starting logcat for 2 device(s) (hidden)...
 
-  [Meta_Quest_3_vanilla] pid=56240  ->  Logs\Meta_Quest_3_vanilla_unity.log
-  [192.168.1.100_5555]   pid=58488  ->  Logs\192.168.1.100_5555_unity.log
+  [Meta_Quest_3_vanilla] pid=56240  ->  Logs\Meta_Quest_3_vanilla_unity_20260517_023355.log
+  [Meta_Quest_3_wifi] pid=58488  ->  Logs\Meta_Quest_3_wifi_unity_20260517_023355.log
 
 Recording. Press Ctrl+C to stop and flush.
 ```
 
 ### デバイスニックネーム
 
-デフォルトでは ADB シリアル番号がそのままログファイル名に使われます。分かりやすい名前を付けたい場合は、`device_nicknames.txt.example` をコピーして `device_nicknames.txt` を作成し、マッピングを記述してください。
+デフォルトでは ADB シリアル番号がログファイル名に使われます（括弧を除き、空白とコロンは `_` に置き換える。例: `192.168.1.100:5555` → `192.168.1.100_5555`）。分かりやすい名前を付けたい場合は、`device_nicknames.txt.example` をコピーして `device_nicknames.txt` を作成し、マッピングを記述してください。
 
 ```powershell
 copy device_nicknames.txt.example device_nicknames.txt
